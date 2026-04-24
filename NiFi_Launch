@@ -1,0 +1,133 @@
+############################################
+# INITIALIZE PARAMETERS AND VARIABLES      #
+############################################
+CLIENT_IP="10.10.10.10" # Change this to your IP at https://checkip.amazonaws.com/
+EC2_NAME="ais-nifi-ec2"
+KEY_NAME="${EC2_NAME}-keypair"
+KEY_FILE="${KEY_NAME}.pem"
+ 
+# Get Cloud9 private IP via IMDSv2
+TOKEN=`curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600"`
+CLOUD9_PRIVATE_IP=`curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4`
+ 
+############################################
+# AWS CONFIGURATION                        #
+############################################
+aws configure set region us-east-1
+export AWS_SHARED_CREDENTIALS_FILE=/home/ec2-user/.aws/credentials
+ 
+############################################
+# CREATE S3 BRONZE BUCKET                  #
+############################################
+S3_BUCKET_NAME=`aws s3api list-buckets --query "Buckets[0].Name" --output text`
+ 
+if [ "${S3_BUCKET_NAME}" == "None" ];
+then
+    S3_BUCKET_NAME="ais-bronze-`uuidgen | tr '[:upper:]' '[:lower:]'`"
+    aws s3api create-bucket --bucket ${S3_BUCKET_NAME} --no-cli-pager
+    echo "Created S3 bucket: ${S3_BUCKET_NAME}"
+else
+    echo "Using existing S3 bucket: ${S3_BUCKET_NAME}"
+fi
+ 
+echo $S3_BUCKET_NAME > s3-bucket-name.txt
+ 
+############################################
+# SECURITY GROUP                           #
+############################################
+CIDR_SUFFIX="/32"
+if [ "${CLIENT_IP}" = "0.0.0.0" ]; then
+    CIDR_SUFFIX="/0"
+fi
+ 
+aws ec2 create-key-pair \
+    --key-name "${KEY_NAME}" \
+    --query 'KeyMaterial' \
+    --output text > "${KEY_FILE}"
+ 
+chmod 400 "${KEY_FILE}"
+ 
+aws ec2 create-security-group \
+    --group-name "${EC2_NAME}-sg" \
+    --description "NiFi AIS project security group"
+ 
+SECURITY_GROUP_ID=`aws ec2 describe-security-groups \
+    --group-names "${EC2_NAME}-sg" \
+    --query "SecurityGroups[0].GroupId" \
+    --output text`
+ 
+# Allow NiFi UI from client IP
+aws ec2 authorize-security-group-ingress \
+    --group-id ${SECURITY_GROUP_ID} \
+    --protocol tcp --port 9080 \
+    --cidr "${CLIENT_IP}${CIDR_SUFFIX}"
+ 
+# Allow SSH from Cloud9 only
+aws ec2 authorize-security-group-ingress \
+    --group-id ${SECURITY_GROUP_ID} \
+    --protocol tcp --port 22 \
+    --cidr "${CLOUD9_PRIVATE_IP}/32"
+ 
+############################################
+# LAUNCH EC2 INSTANCE                      #
+############################################
+aws ec2 run-instances \
+    --image-id ami-06e46074ae430fba6 \
+    --count 1 \
+    --instance-type t2.large \
+    --key-name ${KEY_NAME} \
+    --security-group-ids ${SECURITY_GROUP_ID} \
+    --iam-instance-profile Name=EMR_EC2_DefaultRole \
+    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${EC2_NAME}}]" \
+    --output text
+ 
+EC2_INSTANCE_ID=`aws ec2 describe-instances \
+    --filters "Name=tag:Name,Values=${EC2_NAME}" \
+              "Name=instance-state-name,Values=pending,running" \
+    --query 'Reservations[0].Instances[0].InstanceId' \
+    --output text`
+ 
+echo "Waiting for EC2 instance to be running..."
+aws ec2 wait instance-running --instance-ids ${EC2_INSTANCE_ID}
+echo "EC2 instance is running: ${EC2_INSTANCE_ID}"
+ 
+############################################
+# FETCH EC2 DNS                            #
+############################################
+EC2_DNS=`aws ec2 describe-instances \
+    --filters "Name=tag:Name,Values=${EC2_NAME}" \
+              "Name=instance-state-name,Values=running" \
+    --query 'Reservations[0].Instances[0].PublicDnsName' \
+    --output text`
+ 
+echo $EC2_DNS > ec2-dns.txt
+echo "${EC2_DNS}:9080/nifi" > nifi-url.txt
+echo "S3 Bucket: $(cat s3-bucket-name.txt)"
+echo "NiFi URL (after setup): http://$(cat nifi-url.txt)"
+
+############################################
+# SSH Tunnel
+############################################
+ssh -i ${KEY_FILE} ec2-user@${EC2_DNS}
+############################################
+# IN EC2 RUN THESE         #
+############################################
+# Install and start Docker
+sudo yum install docker -y
+sudo service docker start
+
+# Create NiFi output directory
+mkdir /home/ec2-user/ais-nifi-output
+chmod 777 /home/ec2-user/ais-nifi-output
+
+# Run NiFi container
+sudo docker run -d \
+    -p 9080:8080 \
+    --name nifi_ais \
+    -v /home/ec2-user/ais-nifi-output:/tmp/nifi-output \
+    apache/nifi:1.9.2
+
+# Wait a few minutes and Check if NiFi is running
+curl -s -o /dev/null -w "%{http_code}" http://localhost:9080/nifi
+
+# Open Nifi with "nifi-url.txt"
